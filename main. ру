@@ -7,6 +7,7 @@ import os
 import re
 import time
 import secrets
+import traceback
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -15,13 +16,15 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import (
-    BigInteger, Boolean, ForeignKey, String, Text,
+    BigInteger, Boolean, ForeignKey, Integer, String, Text,
     select, delete, desc,
 )
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 load_dotenv()
+
+print(">>> main.py загружается...", flush=True)
 
 
 # ============================================================
@@ -30,7 +33,10 @@ load_dotenv()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 DATABASE_URL_RAW = (os.getenv("DATABASE_URL") or "").strip()
 
-# Запрещённые слова — добавьте свои (регистр не важен)
+print(f">>> ADMIN_PASSWORD задан: {'да' if ADMIN_PASSWORD != 'changeme' else 'нет (используется по умолчанию)'}", flush=True)
+print(f">>> DATABASE_URL задан: {'да' if DATABASE_URL_RAW else 'нет (используется SQLite)'}", flush=True)
+
+# Запрещённые слова (регистр не важен)
 BANNED_WORDS: list[str] = [
     # "дурак", "спам", "реклама",
 ]
@@ -55,31 +61,33 @@ NOUNS = ["Плехановец", "Экономист", "Студент", "Ана
 
 
 # ============================================================
-#   БД
+#   БД — построение движка
 # ============================================================
 def _build_engine():
     if not DATABASE_URL_RAW:
-        # Локальная разработка без Neon
+        print(">>> Использую локальный SQLite: chat.db", flush=True)
         return create_async_engine("sqlite+aiosqlite:///./chat.db", echo=False)
 
     url = DATABASE_URL_RAW
-    connect_args = {}
 
-    # Neon отдаёт ?sslmode=require — asyncpg это не понимает
+    # Убираем все query-параметры (?sslmode=require и т.п.)
+    # Neon требует SSL — передадим его отдельно через connect_args
     if "?" in url:
-        url, _, query = url.partition("?")
-        for part in query.split("&"):
-            if part.startswith("sslmode="):
-                connect_args["ssl"] = part.split("=", 1)[1]
+        url = url.split("?", 1)[0]
 
+    # Приводим схему к asyncpg
     if url.startswith("postgres://"):
         url = "postgresql+asyncpg://" + url[len("postgres://"):]
     elif url.startswith("postgresql://"):
         url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+    elif not url.startswith("postgresql+asyncpg://"):
+        url = "postgresql+asyncpg://" + url
+
+    print(f">>> Подключаюсь к PostgreSQL: {url.split('@')[-1]}", flush=True)
 
     return create_async_engine(
         url,
-        connect_args=connect_args,
+        connect_args={"ssl": True},
         pool_pre_ping=True,
         pool_recycle=1800,
         echo=False,
@@ -96,7 +104,7 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "users"
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)
     nick: Mapped[str] = mapped_column(String(50))
     token: Mapped[str] = mapped_column(String(80), unique=True, index=True)
@@ -107,7 +115,7 @@ class User(Base):
 
 class Message(Base):
     __tablename__ = "messages"
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     phone: Mapped[str] = mapped_column(String(20), index=True)
     nick: Mapped[str] = mapped_column(String(50))
@@ -117,8 +125,10 @@ class Message(Base):
 
 
 async def init_db():
+    print(">>> Создаю таблицы в БД...", flush=True)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    print(">>> Таблицы готовы.", flush=True)
 
 
 # ============================================================
@@ -148,7 +158,12 @@ def filter_text(text: str) -> str:
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    try:
+        await init_db()
+    except Exception as e:
+        print(f">>> ОШИБКА при инициализации БД: {e}", flush=True)
+        traceback.print_exc()
+        raise
     yield
 
 
@@ -246,6 +261,14 @@ async def get_user_by_token(token: str) -> Optional[User]:
 def check_admin(token: str):
     if token not in ADMIN_TOKENS:
         raise HTTPException(403, "Нет доступа")
+
+
+# ============================================================
+#   HEALTHCHECK
+# ============================================================
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "time": now_ms()}
 
 
 # ============================================================
@@ -515,7 +538,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     flex-direction: column; gap: 12px; }
   .messages::-webkit-scrollbar { width: 6px; }
   .messages::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
-  .msg { display: flex; flex-direction: column; max-width: 78%; }
+  .msg { display: flex; flex-direction: column; max-width: 78Bar%; }
   .msg.own { align-self: flex-end; align-items: flex-end; }
   .msg .nick { font-size: 11px; color: #8ecae6; margin-bottom: 3px; padding-left: 6px; }
   .msg.own .nick { color: #6dd5ed; }
@@ -579,7 +602,7 @@ const errorMsg   = el('errorMsg');
 const msgInput   = el('msgInput');
 const sendBtn    = el('sendBtn');
 const logoutBtn  = el('logoutBtn');
-const roomsBar   = el('roomsBar');
+const roomsBar   = el('rooms');
 const roomLabel  = el('roomLabel');
 
 function showChat() {
