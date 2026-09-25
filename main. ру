@@ -1,0 +1,960 @@
+"""
+РЭУ Чат — единый файл.
+Бэкенд (FastAPI + WebSocket + SQLAlchemy) + фронтенд (HTML/CSS/JS).
+"""
+
+import os
+import re
+import time
+import secrets
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from sqlalchemy import (
+    BigInteger, Boolean, ForeignKey, String, Text,
+    select, delete, desc,
+)
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+load_dotenv()
+
+
+# ============================================================
+#   НАСТРОЙКИ
+# ============================================================
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
+DATABASE_URL_RAW = (os.getenv("DATABASE_URL") or "").strip()
+
+# Запрещённые слова — добавьте свои (регистр не важен)
+BANNED_WORDS: list[str] = [
+    # "дурак", "спам", "реклама",
+]
+REPLACEMENT = "***"
+
+MAX_MESSAGE_LEN = 500
+HISTORY_LIMIT = 200
+
+ROOMS = {
+    "general":    "Общий",
+    "economics":  "Экономика",
+    "finance":    "Финансы",
+    "management": "Менеджмент",
+    "marketing":  "Маркетинг",
+    "logistics":  "Логистика",
+}
+
+ADJECTIVES = ["Быстрый", "Тихий", "Умный", "Смелый", "Ночной",
+              "Яркий", "Хитрый", "Добрый", "Весёлый", "Спокойный"]
+NOUNS = ["Плехановец", "Экономист", "Студент", "Аналитик",
+         "Финансист", "Маркетолог", "Логист", "Бухгалтер"]
+
+
+# ============================================================
+#   БД
+# ============================================================
+def _build_engine():
+    if not DATABASE_URL_RAW:
+        # Локальная разработка без Neon
+        return create_async_engine("sqlite+aiosqlite:///./chat.db", echo=False)
+
+    url = DATABASE_URL_RAW
+    connect_args = {}
+
+    # Neon отдаёт ?sslmode=require — asyncpg это не понимает
+    if "?" in url:
+        url, _, query = url.partition("?")
+        for part in query.split("&"):
+            if part.startswith("sslmode="):
+                connect_args["ssl"] = part.split("=", 1)[1]
+
+    if url.startswith("postgres://"):
+        url = "postgresql+asyncpg://" + url[len("postgres://"):]
+    elif url.startswith("postgresql://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+
+    return create_async_engine(
+        url,
+        connect_args=connect_args,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        echo=False,
+    )
+
+
+engine = _build_engine()
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    nick: Mapped[str] = mapped_column(String(50))
+    token: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    room: Mapped[str] = mapped_column(String(30), default="general")
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+
+
+class Message(Base):
+    __tablename__ = "messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    phone: Mapped[str] = mapped_column(String(20), index=True)
+    nick: Mapped[str] = mapped_column(String(50))
+    room: Mapped[str] = mapped_column(String(30), index=True)
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[int] = mapped_column(BigInteger, index=True)
+
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+# ============================================================
+#   УТИЛИТЫ
+# ============================================================
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def normalize_phone(raw: str) -> str:
+    return re.sub(r"\D", "", raw or "")
+
+
+def generate_nick() -> str:
+    return f"{secrets.choice(ADJECTIVES)} {secrets.choice(NOUNS)}"
+
+
+def filter_text(text: str) -> str:
+    if not BANNED_WORDS:
+        return text
+    pat = re.compile("|".join(re.escape(w) for w in BANNED_WORDS), re.IGNORECASE)
+    return pat.sub(REPLACEMENT, text)
+
+
+# ============================================================
+#   LIFESPAN
+# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+
+app = FastAPI(title="РЭУ Чат", lifespan=lifespan)
+
+
+# ============================================================
+#   WEBSOCKET MANAGER
+# ============================================================
+class Manager:
+    def __init__(self):
+        self.conns: dict[int, tuple[WebSocket, str]] = {}
+
+    async def connect(self, user_id: int, ws: WebSocket, room: str):
+        await ws.accept()
+        old = self.conns.get(user_id)
+        if old is not None:
+            try:
+                await old[0].close(code=4000)
+            except Exception:
+                pass
+        self.conns[user_id] = (ws, room)
+
+    def disconnect(self, user_id: int):
+        self.conns.pop(user_id, None)
+
+    def set_room(self, user_id: int, room: str):
+        if user_id in self.conns:
+            ws, _ = self.conns[user_id]
+            self.conns[user_id] = (ws, room)
+
+    async def broadcast_room(self, room: str, payload: dict):
+        dead = []
+        for uid, (ws, r) in list(self.conns.items()):
+            if r != room:
+                continue
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(uid)
+        for uid in dead:
+            self.conns.pop(uid, None)
+
+    async def force_disconnect(self, user_id: int, code: int = 4001):
+        entry = self.conns.pop(user_id, None)
+        if entry:
+            try:
+                await entry[0].close(code=code)
+            except Exception:
+                pass
+
+
+manager = Manager()
+ADMIN_TOKENS: set[str] = set()
+
+
+# ============================================================
+#   PYDANTIC МОДЕЛИ
+# ============================================================
+class LoginReq(BaseModel):
+    phone: str
+
+
+class RoomReq(BaseModel):
+    token: str
+    room: str
+
+
+class AdminLoginReq(BaseModel):
+    password: str
+
+
+class BanReq(BaseModel):
+    admin_token: str
+    user_id: int
+    banned: bool
+
+
+class DeleteMsgReq(BaseModel):
+    admin_token: str
+    message_id: int
+
+
+# ============================================================
+#   ХЕЛПЕРЫ
+# ============================================================
+async def get_user_by_token(token: str) -> Optional[User]:
+    if not token:
+        return None
+    async with SessionLocal() as s:
+        res = await s.execute(select(User).where(User.token == token))
+        return res.scalar_one_or_none()
+
+
+def check_admin(token: str):
+    if token not in ADMIN_TOKENS:
+        raise HTTPException(403, "Нет доступа")
+
+
+# ============================================================
+#   ПУБЛИЧНОЕ API
+# ============================================================
+@app.post("/api/login")
+async def login(req: LoginReq):
+    phone = normalize_phone(req.phone)
+    if not (10 <= len(phone) <= 15):
+        raise HTTPException(400, "Некорректный номер телефона")
+
+    async with SessionLocal() as s:
+        res = await s.execute(select(User).where(User.phone == phone))
+        user = res.scalar_one_or_none()
+
+        if user is None:
+            user = User(
+                phone=phone,
+                nick=generate_nick(),
+                token=secrets.token_urlsafe(40),
+                room="general",
+                is_banned=False,
+                created_at=now_ms(),
+            )
+            s.add(user)
+            await s.commit()
+            await s.refresh(user)
+
+        if user.is_banned:
+            raise HTTPException(403, "Ваш номер заблокирован администратором")
+
+        return {
+            "token": user.token,
+            "phone": user.phone,
+            "nick": user.nick,
+            "room": user.room,
+        }
+
+
+@app.get("/api/rooms")
+async def rooms():
+    return [{"id": k, "title": v} for k, v in ROOMS.items()]
+
+
+@app.post("/api/room")
+async def set_room(req: RoomReq):
+    if req.room not in ROOMS:
+        raise HTTPException(400, "Неизвестная комната")
+    async with SessionLocal() as s:
+        res = await s.execute(select(User).where(User.token == req.token))
+        user = res.scalar_one_or_none()
+        if user is None:
+            raise HTTPException(401, "Не авторизован")
+        user.room = req.room
+        await s.commit()
+        manager.set_room(user.id, req.room)
+        return {"room": user.room}
+
+
+@app.get("/api/messages")
+async def get_messages(room: str = "general", limit: int = HISTORY_LIMIT):
+    if room not in ROOMS:
+        raise HTTPException(400, "Неизвестная комната")
+    limit = min(max(1, limit), 500)
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(Message)
+            .where(Message.room == room)
+            .order_by(desc(Message.created_at))
+            .limit(limit)
+        )
+        rows = res.scalars().all()
+    rows.reverse()
+    return [
+        {"phone": m.phone, "nick": m.nick, "text": m.text, "time": m.created_at}
+        for m in rows
+    ]
+
+
+# ============================================================
+#   WEBSOCKET
+# ============================================================
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket, token: str = ""):
+    user = await get_user_by_token(token)
+    if user is None:
+        await websocket.close(code=4001)
+        return
+    if user.is_banned:
+        await websocket.close(code=4002)
+        return
+
+    await manager.connect(user.id, websocket, user.room)
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            text = (data.get("text") or "").strip()
+            if not text:
+                continue
+
+            async with SessionLocal() as s:
+                res = await s.execute(select(User).where(User.id == user.id))
+                fresh = res.scalar_one_or_none()
+                if fresh is None or fresh.is_banned:
+                    await websocket.close(code=4002)
+                    manager.disconnect(user.id)
+                    return
+                current_room = fresh.room
+                current_nick = fresh.nick
+
+            text = filter_text(text)[:MAX_MESSAGE_LEN]
+            ts = now_ms()
+
+            async with SessionLocal() as s:
+                s.add(Message(
+                    user_id=user.id,
+                    phone=user.phone,
+                    nick=current_nick,
+                    room=current_room,
+                    text=text,
+                    created_at=ts,
+                ))
+                await s.commit()
+
+            await manager.broadcast_room(current_room, {
+                "type": "message",
+                "data": {
+                    "phone": user.phone,
+                    "nick": current_nick,
+                    "room": current_room,
+                    "text": text,
+                    "time": ts,
+                },
+            })
+    except WebSocketDisconnect:
+        manager.disconnect(user.id)
+    except Exception:
+        manager.disconnect(user.id)
+
+
+# ============================================================
+#   ADMIN API
+# ============================================================
+@app.post("/api/admin/login")
+async def admin_login(req: AdminLoginReq):
+    if not ADMIN_PASSWORD or req.password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Неверный пароль")
+    t = secrets.token_urlsafe(32)
+    ADMIN_TOKENS.add(t)
+    return {"admin_token": t}
+
+
+@app.get("/api/admin/users")
+async def admin_users(admin_token: str):
+    check_admin(admin_token)
+    async with SessionLocal() as s:
+        res = await s.execute(select(User).order_by(desc(User.created_at)).limit(500))
+        users = res.scalars().all()
+    return [
+        {
+            "id": u.id, "phone": u.phone, "nick": u.nick,
+            "room": u.room, "is_banned": u.is_banned,
+            "created_at": u.created_at,
+        }
+        for u in users
+    ]
+
+
+@app.get("/api/admin/messages")
+async def admin_messages(admin_token: str, limit: int = 200):
+    check_admin(admin_token)
+    limit = min(max(1, limit), 500)
+    async with SessionLocal() as s:
+        res = await s.execute(
+            select(Message).order_by(desc(Message.created_at)).limit(limit)
+        )
+        rows = res.scalars().all()
+    return [
+        {
+            "id": m.id, "phone": m.phone, "nick": m.nick,
+            "room": m.room, "text": m.text, "time": m.created_at,
+        }
+        for m in rows
+    ]
+
+
+@app.post("/api/admin/ban")
+async def admin_ban(req: BanReq):
+    check_admin(req.admin_token)
+    async with SessionLocal() as s:
+        res = await s.execute(select(User).where(User.id == req.user_id))
+        user = res.scalar_one_or_none()
+        if user is None:
+            raise HTTPException(404, "Пользователь не найден")
+        user.is_banned = req.banned
+        await s.commit()
+
+    if req.banned:
+        await manager.force_disconnect(req.user_id, code=4002)
+
+    return {"ok": True, "banned": req.banned}
+
+
+@app.post("/api/admin/delete_message")
+async def admin_delete_msg(req: DeleteMsgReq):
+    check_admin(req.admin_token)
+    async with SessionLocal() as s:
+        await s.execute(delete(Message).where(Message.id == req.message_id))
+        await s.commit()
+    return {"ok": True}
+
+
+# ============================================================
+#   ФРОНТЕНД
+# ============================================================
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>РЭУ Чат — студенты Плехановки</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    color: #fff; }
+  .container { width: 100%; max-width: 480px; height: 92vh; max-height: 760px;
+    background: rgba(255,255,255,0.06); backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 20px;
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+  .header { padding: 14px 20px; background: rgba(0,0,0,0.25);
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .header h1 { font-size: 16px; font-weight: 600; }
+  .header .sub { font-size: 11px; color: #8ecae6; margin-top: 2px; }
+  .logout { background: transparent; border: 1px solid rgba(255,255,255,0.2);
+    color: #ccc; padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 12px; }
+  .logout:hover { background: rgba(255,255,255,0.1); color: #fff; }
+  .rooms { display: flex; gap: 6px; padding: 10px 14px; overflow-x: auto;
+    background: rgba(0,0,0,0.15); border-bottom: 1px solid rgba(255,255,255,0.06);
+    scrollbar-width: none; }
+  .rooms::-webkit-scrollbar { display: none; }
+  .room-btn { flex-shrink: 0; padding: 7px 14px; border-radius: 20px;
+    border: 1px solid rgba(255,255,255,0.15); background: transparent;
+    color: #cfd8dc; font-size: 12.5px; cursor: pointer; }
+  .room-btn:hover { background: rgba(255,255,255,0.08); }
+  .room-btn.active { background: linear-gradient(135deg, #2193b0, #6dd5ed);
+    color: #041a1f; border-color: transparent; font-weight: 600; }
+  .auth { flex: 1; display: flex; flex-direction: column; justify-content: center;
+    padding: 40px 32px; gap: 16px; }
+  .auth h2 { font-size: 22px; }
+  .auth p { font-size: 13px; color: #a0b4c2; }
+  .auth input { width: 100%; padding: 14px 16px; border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3);
+    color: #fff; font-size: 15px; outline: none; }
+  .auth input:focus { border-color: #8ecae6; }
+  .auth button { padding: 14px; border-radius: 12px; border: none;
+    background: linear-gradient(90deg, #2193b0, #6dd5ed); color: #041a1f;
+    font-weight: 700; font-size: 15px; cursor: pointer; }
+  .auth button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .error { color: #ff6b6b; font-size: 13px; min-height: 18px; }
+  .hint { font-size: 11px; color: #7b8a96; text-align: center; }
+  .messages { flex: 1; overflow-y: auto; padding: 16px; display: flex;
+    flex-direction: column; gap: 12px; }
+  .messages::-webkit-scrollbar { width: 6px; }
+  .messages::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+  .msg { display: flex; flex-direction: column; max-width: 78%; }
+  .msg.own { align-self: flex-end; align-items: flex-end; }
+  .msg .nick { font-size: 11px; color: #8ecae6; margin-bottom: 3px; padding-left: 6px; }
+  .msg.own .nick { color: #6dd5ed; }
+  .msg .bubble { padding: 10px 14px; border-radius: 16px;
+    background: rgba(255,255,255,0.1); font-size: 14px; line-height: 1.4;
+    word-break: break-word; }
+  .msg.own .bubble { background: linear-gradient(135deg, #2193b0, #6dd5ed); color: #041a1f; }
+  .msg .time { font-size: 10px; color: #6b7a86; margin-top: 3px; padding: 0 6px; }
+  .input-row { display: flex; gap: 10px; padding: 14px 16px;
+    background: rgba(0,0,0,0.3); border-top: 1px solid rgba(255,255,255,0.08); }
+  .input-row input { flex: 1; padding: 12px 16px; border-radius: 24px;
+    border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06);
+    color: #fff; font-size: 14px; outline: none; }
+  .input-row input:focus { border-color: #8ecae6; }
+  .input-row button { width: 46px; height: 46px; border-radius: 50%; border: none;
+    background: linear-gradient(135deg, #2193b0, #6dd5ed); color: #041a1f;
+    font-size: 18px; cursor: pointer; }
+  .input-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .empty { color: #6b7a86; font-size: 13px; text-align: center; margin: auto; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div>
+      <h1>🎓 РЭУ Чат</h1>
+      <div class="sub" id="roomLabel">Анонимный чат студентов Плехановки</div>
+    </div>
+    <button class="logout" id="logoutBtn" style="display:none">Выйти</button>
+  </div>
+  <div class="rooms" id="roomsBar" style="display:none"></div>
+  <div class="auth" id="authScreen">
+    <h2>Вход в чат</h2>
+    <p>Введите номер телефона. Регистрация — один раз на номер.</p>
+    <input type="tel" id="phoneInput" placeholder="+7 999 123-45-67" autocomplete="tel">
+    <button id="loginBtn">Войти / Зарегистрироваться</button>
+    <div class="error" id="errorMsg"></div>
+    <div class="hint">Код не отправляется — вход мгновенный</div>
+  </div>
+  <div class="messages" id="messages" style="display:none"></div>
+  <div class="input-row" id="inputRow" style="display:none">
+    <input type="text" id="msgInput" placeholder="Написать сообщение..." maxlength="500">
+    <button id="sendBtn">➤</button>
+  </div>
+</div>
+<script>
+const state = {
+  token: localStorage.getItem('reu_token') || null,
+  phone: localStorage.getItem('reu_phone') || null,
+  nick:  localStorage.getItem('reu_nick')  || null,
+  room:  localStorage.getItem('reu_room')  || 'general',
+  ws: null, rooms: [],
+};
+const el = id => document.getElementById(id);
+const authScreen = el('authScreen');
+const messagesEl = el('messages');
+const inputRow   = el('inputRow');
+const phoneInput = el('phoneInput');
+const loginBtn   = el('loginBtn');
+const errorMsg   = el('errorMsg');
+const msgInput   = el('msgInput');
+const sendBtn    = el('sendBtn');
+const logoutBtn  = el('logoutBtn');
+const roomsBar   = el('roomsBar');
+const roomLabel  = el('roomLabel');
+
+function showChat() {
+  authScreen.style.display = 'none';
+  messagesEl.style.display = 'flex';
+  inputRow.style.display = 'flex';
+  logoutBtn.style.display = 'block';
+  roomsBar.style.display = 'flex';
+}
+function showAuth() {
+  authScreen.style.display = 'flex';
+  messagesEl.style.display = 'none';
+  inputRow.style.display = 'none';
+  logoutBtn.style.display = 'none';
+  roomsBar.style.display = 'none';
+}
+function fmt(ts) {
+  return new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+}
+function msgEl(m) {
+  const isOwn = state.phone && m.phone === state.phone;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg' + (isOwn ? ' own' : '');
+  const nick = document.createElement('div');
+  nick.className = 'nick'; nick.textContent = isOwn ? 'Вы' : m.nick;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble'; bubble.textContent = m.text;
+  const time = document.createElement('div');
+  time.className = 'time'; time.textContent = fmt(m.time);
+  wrap.append(nick, bubble, time);
+  return wrap;
+}
+function renderAll(list) {
+  messagesEl.innerHTML = '';
+  if (!list || !list.length) {
+    const e = document.createElement('div');
+    e.className = 'empty'; e.textContent = 'Пока сообщений нет. Напишите первым! 👋';
+    messagesEl.appendChild(e); return;
+  }
+  list.forEach(m => messagesEl.appendChild(msgEl(m)));
+}
+function appendMsg(m) {
+  const e = messagesEl.querySelector('.empty');
+  if (e) e.remove();
+  messagesEl.appendChild(msgEl(m));
+}
+function scrollBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
+
+async function loadRooms() {
+  const res = await fetch('/api/rooms');
+  state.rooms = await res.json();
+  renderRoomsBar();
+}
+function renderRoomsBar() {
+  roomsBar.innerHTML = '';
+  state.rooms.forEach(r => {
+    const b = document.createElement('button');
+    b.className = 'room-btn' + (r.id === state.room ? ' active' : '');
+    b.textContent = r.title;
+    b.onclick = () => switchRoom(r.id);
+    roomsBar.appendChild(b);
+  });
+  const cur = state.rooms.find(r => r.id === state.room);
+  roomLabel.textContent = cur ? 'Комната: ' + cur.title : 'Анонимный чат';
+}
+async function loadMessages() {
+  const res = await fetch('/api/messages?room=' + encodeURIComponent(state.room));
+  const data = await res.json();
+  renderAll(data);
+  scrollBottom();
+}
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = proto + '//' + location.host + '/ws?token=' + encodeURIComponent(state.token);
+  const ws = new WebSocket(url);
+  state.ws = ws;
+  ws.onopen = () => { sendBtn.disabled = false; };
+  ws.onmessage = e => {
+    let msg; try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === 'message' && msg.data.room === state.room) {
+      appendMsg(msg.data); scrollBottom();
+    }
+  };
+  ws.onclose = e => {
+    sendBtn.disabled = true;
+    if (e.code === 4001) { logout(); return; }
+    if (e.code === 4002) {
+      alert('Ваш аккаунт заблокирован администратором');
+      logout(); return;
+    }
+    if (state.token) setTimeout(connectWS, 2000);
+  };
+}
+async function switchRoom(room) {
+  if (room === state.room) return;
+  state.room = room;
+  localStorage.setItem('reu_room', room);
+  await fetch('/api/room', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: state.token, room }),
+  });
+  if (state.ws) { try { state.ws.close(1000); } catch(e) {} state.ws = null; }
+  renderRoomsBar();
+  await loadMessages();
+  connectWS();
+}
+loginBtn.onclick = async () => {
+  const raw = phoneInput.value.trim();
+  if (!raw) { errorMsg.textContent = 'Введите номер'; return; }
+  loginBtn.disabled = true; errorMsg.textContent = '';
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: raw }),
+    });
+    const data = await res.json();
+    if (!res.ok) { errorMsg.textContent = data.detail || 'Ошибка входа'; return; }
+    state.token = data.token; state.phone = data.phone;
+    state.nick = data.nick; state.room = data.room || 'general';
+    localStorage.setItem('reu_token', state.token);
+    localStorage.setItem('reu_phone', state.phone);
+    localStorage.setItem('reu_nick',  state.nick);
+    localStorage.setItem('reu_room',  state.room);
+    showChat();
+    await loadRooms();
+    await loadMessages();
+    connectWS();
+  } catch (err) {
+    errorMsg.textContent = 'Сервер недоступен';
+  } finally { loginBtn.disabled = false; }
+};
+phoneInput.onkeydown = e => { if (e.key === 'Enter') loginBtn.click(); };
+function logout() {
+  if (state.ws) { try { state.ws.close(1000); } catch(e) {} state.ws = null; }
+  ['reu_token','reu_phone','reu_nick','reu_room'].forEach(k => localStorage.removeItem(k));
+  state.token = state.phone = state.nick = null;
+  state.room = 'general';
+  phoneInput.value = '';
+  showAuth();
+}
+logoutBtn.onclick = logout;
+function send() {
+  const text = msgInput.value.trim();
+  if (!text || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  state.ws.send(JSON.stringify({ text }));
+  msgInput.value = '';
+}
+sendBtn.onclick = send;
+msgInput.onkeydown = e => { if (e.key === 'Enter') send(); };
+(async function init() {
+  await loadRooms();
+  if (state.token && state.phone && state.nick) {
+    showChat();
+    await loadMessages();
+    connectWS();
+  } else { showAuth(); }
+})();
+</script>
+</body>
+</html>
+"""
+
+
+ADMIN_HTML = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>РЭУ Чат — Админ-панель</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: #0f1419; color: #e6edf3; min-height: 100vh; padding: 24px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: #7b8794; font-size: 13px; margin-bottom: 24px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    padding: 20px; margin-bottom: 20px; }
+  .login-row { display: flex; gap: 10px; max-width: 480px; }
+  input[type=password], input[type=text] { flex: 1; padding: 12px 14px;
+    border-radius: 8px; border: 1px solid #30363d; background: #0d1117;
+    color: #e6edf3; font-size: 14px; outline: none; }
+  input:focus { border-color: #58a6ff; }
+  button { padding: 10px 16px; border-radius: 8px; border: none; cursor: pointer;
+    font-size: 13px; font-weight: 600; }
+  .btn-primary { background: #238636; color: #fff; }
+  .btn-primary:hover { background: #2ea043; }
+  .btn-danger { background: #da3633; color: #fff; padding: 6px 10px; }
+  .btn-danger:hover { background: #f85149; }
+  .btn-warn { background: #9e6a03; color: #fff; padding: 6px 10px; }
+  .btn-warn:hover { background: #bb8009; }
+  .btn-ghost { background: #21262d; color: #e6edf3; padding: 6px 10px;
+    border: 1px solid #30363d; }
+  .btn-ghost:hover { background: #30363d; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+  .tab { padding: 8px 16px; border-radius: 8px; cursor: pointer;
+    background: #21262d; color: #e6edf3; border: 1px solid #30363d; font-size: 13px; }
+  .tab.active { background: #58a6ff; color: #0d1117; border-color: #58a6ff; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #21262d; }
+  th { color: #7b8794; font-weight: 500; font-size: 12px; text-transform: uppercase; }
+  tr:hover td { background: #1c2128; }
+  .banned { color: #f85149; font-weight: 600; }
+  .ok { color: #3fb950; }
+  .msg-text { max-width: 500px; word-break: break-word; }
+  .muted { color: #7b8794; font-size: 12px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🛡️ РЭУ Чат — админ-панель</h1>
+  <div class="sub">Управление пользователями и сообщениями</div>
+  <div class="card" id="loginCard">
+    <div class="login-row">
+      <input type="password" id="pw" placeholder="Пароль администратора">
+      <button class="btn-primary" id="loginBtn">Войти</button>
+    </div>
+    <div id="loginError" class="banned" style="margin-top:10px; font-size:13px"></div>
+  </div>
+  <div id="panel" class="hidden">
+    <div class="tabs">
+      <div class="tab active" data-tab="users">Пользователи</div>
+      <div class="tab" data-tab="messages">Сообщения</div>
+      <div style="margin-left:auto">
+        <button class="btn-ghost" id="refreshBtn">🔄 Обновить</button>
+        <button class="btn-ghost" id="logoutBtn">Выйти</button>
+      </div>
+    </div>
+    <div class="card" id="usersTab">
+      <table>
+        <thead><tr><th>ID</th><th>Телефон</th><th>Ник</th><th>Комната</th>
+          <th>Статус</th><th>Регистрация</th><th></th></tr></thead>
+        <tbody id="usersBody"></tbody>
+      </table>
+    </div>
+    <div class="card hidden" id="messagesTab">
+      <table>
+        <thead><tr><th>ID</th><th>Комната</th><th>Ник</th><th>Сообщение</th>
+          <th>Время</th><th></th></tr></thead>
+        <tbody id="msgsBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+const state = { token: sessionStorage.getItem('admin_token') || null };
+const $ = id => document.getElementById(id);
+const loginCard = $('loginCard');
+const panel = $('panel');
+function fmtDate(ts) { return new Date(ts).toLocaleString('ru-RU'); }
+async function doLogin() {
+  const pw = $('pw').value;
+  const res = await fetch('/api/admin/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: pw }),
+  });
+  const data = await res.json();
+  if (!res.ok) { $('loginError').textContent = data.detail || 'Ошибка'; return; }
+  state.token = data.admin_token;
+  sessionStorage.setItem('admin_token', state.token);
+  showPanel();
+}
+function showLogin() { loginCard.classList.remove('hidden'); panel.classList.add('hidden'); }
+function showPanel() { loginCard.classList.add('hidden'); panel.classList.remove('hidden'); loadAll(); }
+async function loadAll() { await Promise.all([loadUsers(), loadMessages()]); }
+async function loadUsers() {
+  const res = await fetch('/api/admin/users?admin_token=' + encodeURIComponent(state.token));
+  if (res.status === 403) { sessionStorage.removeItem('admin_token'); showLogin(); return; }
+  const users = await res.json();
+  const tbody = $('usersBody'); tbody.innerHTML = '';
+  users.forEach(u => {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + u.id + '</td>' +
+      '<td>' + u.phone + '</td>' +
+      '<td>' + escapeHtml(u.nick) + '</td>' +
+      '<td>' + escapeHtml(u.room) + '</td>' +
+      '<td class="' + (u.is_banned ? 'banned' : 'ok') + '">' +
+        (u.is_banned ? 'ЗАБАНЕН' : 'активен') + '</td>' +
+      '<td class="muted">' + fmtDate(u.created_at) + '</td><td></td>';
+    const btn = document.createElement('button');
+    if (u.is_banned) {
+      btn.className = 'btn-primary'; btn.textContent = 'Разбанить';
+      btn.onclick = () => setBan(u.id, false);
+    } else {
+      btn.className = 'btn-danger'; btn.textContent = 'Забанить';
+      btn.onclick = () => setBan(u.id, true);
+    }
+    tr.lastElementChild.appendChild(btn);
+    tbody.appendChild(tr);
+  });
+}
+async function loadMessages() {
+  const res = await fetch('/api/admin/messages?admin_token=' + encodeURIComponent(state.token));
+  if (res.status === 403) return;
+  const msgs = await res.json();
+  const tbody = $('msgsBody'); tbody.innerHTML = '';
+  msgs.forEach(m => {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + m.id + '</td>' +
+      '<td><span class="muted">' + escapeHtml(m.room) + '</span></td>' +
+      '<td>' + escapeHtml(m.nick) + '</td>' +
+      '<td class="msg-text">' + escapeHtml(m.text) + '</td>' +
+      '<td class="muted">' + fmtDate(m.time) + '</td><td></td>';
+    const btn = document.createElement('button');
+    btn.className = 'btn-warn'; btn.textContent = 'Удалить';
+    btn.onclick = () => deleteMsg(m.id);
+    tr.lastElementChild.appendChild(btn);
+    tbody.appendChild(tr);
+  });
+}
+async function setBan(userId, banned) {
+  await fetch('/api/admin/ban', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ admin_token: state.token, user_id: userId, banned }),
+  });
+  loadUsers();
+}
+async function deleteMsg(id) {
+  if (!confirm('Удалить это сообщение?')) return;
+  await fetch('/api/admin/delete_message', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ admin_token: state.token, message_id: id }),
+  });
+  loadMessages();
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+$('loginBtn').onclick = doLogin;
+$('pw').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
+$('refreshBtn').onclick = loadAll;
+$('logoutBtn').onclick = () => {
+  sessionStorage.removeItem('admin_token');
+  state.token = null;
+  showLogin();
+};
+document.querySelectorAll('.tab').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    const which = t.dataset.tab;
+    $('usersTab').classList.toggle('hidden', which !== 'users');
+    $('messagesTab').classList.toggle('hidden', which !== 'messages');
+  };
+});
+if (state.token) showPanel(); else showLogin();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return INDEX_HTML
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    return ADMIN_HTML
+
+
+# ============================================================
+#   ЗАПУСК (локально)
+# ============================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
